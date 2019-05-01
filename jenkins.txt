@@ -1,0 +1,252 @@
+#!/usr/bin/env groovy
+// Copyright © 2018 Province of British Columbia
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//JENKINS DEPLOY ENVIRONMENT VARIABLES:
+// - JENKINS_JAVA_OVERRIDES  -Dhudson.model.DirectoryBrowserSupport.CSP= -Duser.timezone=America/Vancouver
+//   -> user.timezone : set the local timezone so logfiles report correxct time
+//   -> hudson.model.DirectoryBrowserSupport.CSP : removes restrictions on CSS file load, thus html pages of test reports are displayed pretty
+//   See: https://docs.openshift.com/container-platform/3.9/using_images/other_images/jenkins.html for a complete list of JENKINS env vars
+
+// define constants
+// Edit your application's context directory here
+def CONTEXT_DIRECTORY = 'e2e'
+
+// define groovy functions
+import groovy.json.JsonOutput
+
+// send a msg to slack channel that deploy occured
+def notifySlack(text, channel, url, attachments) {
+    def slackURL = url
+    def jenkinsIcon = 'https://wiki.jenkins-ci.org/
+    download/attachments/2916393/logo.png'
+    def payload = JsonOutput.toJson([text: text,
+        channel: channel,
+        username: "Jenkins",
+        icon_url: jenkinsIcon,
+        attachments: attachments
+    ])
+    def encodedReq = URLEncoder.encode(payload, "UTF-8")
+    sh("curl -s -S -X POST " +
+            "--data \'payload=${encodedReq}\' ${slackURL}")
+}
+
+// Determine whether there were any changes the files within the project's context directory.
+// return a string listing commit msgs occurred since last build
+@NonCPS
+String triggerBuild(String contextDirectory) {
+    // Determine if code has changed within the source context directory.
+    def changeLogSets = currentBuild.changeSets
+    def filesChangeCnt = 0
+    MAX_MSG_LEN = 512
+    def changeString = ""
+    for (int i = 0; i < changeLogSets.size(); i++) {
+        def entries = changeLogSets[i].items
+        for (int j = 0; j < entries.length; j++) {
+            def entry = entries[j]
+            //echo "${entry.commitId} by ${entry.author} on ${new Date(entry.timestamp)}: ${entry.msg}"
+            def files = new ArrayList(entry.affectedFiles)
+
+            for (int k = 0; k < files.size(); k++) {
+                def file = files[k]
+                def filePath = file.path
+                //echo ">> ${file.path}"
+                if (filePath.contains(contextDirectory)) {
+
+                    filesChangeCnt = 1
+                    truncated_msg = entry.msg.take(MAX_MSG_LEN)
+                    changeString += " - ${truncated_msg} [${entry.author}]\n"
+                    k = files.size()
+                    j = entries.length
+                }
+            }
+        }
+    }
+    if ( filesChangeCnt < 1 ) {
+        echo('The changes do not require a build.')
+        return ""
+    }
+    else {
+        echo('The changes require a build.')
+        return changeString
+    }
+}
+
+// pipeline
+
+// define job properties - keep 10 builds only
+properties([[$class: 'BuildDiscarderProperty', strategy: [$class: 'LogRotator', artifactDaysToKeepStr: '', artifactNumToKeepStr: '', daysToKeepStr: '', numToKeepStr: '10']]])
+
+def run_pipeline = true
+if( triggerBuild(CONTEXT_DIRECTORY) == "" ) {
+    node {
+        SLACK_TOKEN = sh (
+                    script: """oc get secret/slack -o template --template="{{.data.token}}" | base64 --decode""",
+                        returnStdout: true).trim()
+
+        // send msg to slack
+        def attachment = [:]
+        attachment.fallback = "See build log for more details"
+        attachment.title = "e2e Build ${BUILD_ID} has no changes"
+        attachment.color = "#00FF00" // Lime Green
+        attachment.text = "Proceed anyways?" //+ "\nCommit ${GIT_COMMIT_SHORT_HASH} by ${GIT_COMMIT_AUTHOR}"
+        def decision = [:]
+        decision.type = "button"
+        decision.text = "Proceed/Abort?"
+        decision.url = "https://jenkins-servicebc-ne-tools.pathfinder.gov.bc.ca/job/servicebc-ne-tools/job/servicebc-ne-tools-namex-api-pipeline/${BUILD_ID}/input"
+        decision.short = false
+        attachment.actions = [decision]
+        notifySlack("e2e-${BUILD_ID}", "#e2e", "https://hooks.slack.com/services/${SLACK_TOKEN}", [attachment])
+    }
+    try {
+        timeout(time: 1, unit: 'DAYS') {
+            input message: "Run e2e-pipeline?", id: "1234", submitter: 'admin,ljtrent-admin,thorwolpert-admin,rarmitag-admin,kialj876-edit,katiemcgoff-admin,waltermoar-admin'
+        }
+    } catch (Exception e) {
+        run_pipeline = false;
+    }
+
+}
+
+if (!run_pipeline) {
+    // The changeSets did not contain any changes within the project's context directory.
+    // Clearly indicate there were no changes.
+    stage('No Changes') {
+        node {
+            SLACK_TOKEN = sh (
+                    script: """oc get secret/slack -o template --template="{{.data.token}}" | base64 --decode""",
+                        returnStdout: true).trim()
+
+            // send msg to slack
+            def attachment = [:]
+            attachment.fallback = "See build log for more details"
+            attachment.title = "e2e Build {$BUILD_ID} prevented because there were no changes"
+            attachment.color = "#00FF00" // Lime Green
+            attachment.text = "No changes applied to e2e" //+ "\nCommit ${GIT_COMMIT_SHORT_HASH} by ${GIT_COMMIT_AUTHOR}"
+            notifySlack("e2e-${BUILD_ID}", "#e2e", "https://hooks.slack.com/services/${SLACK_TOKEN}", [attachment])
+
+            currentBuild.result = 'SUCCESS'
+        }
+    }
+} else {
+    //node/pod needs environment setup for testing
+    def py3njs_label = "jenkins-py3nodejs-${UUID.randomUUID().toString()}"
+    podTemplate(label: py3njs_label, name: py3njs_label, serviceAccount: 'jenkins', cloud: 'openshift', containers: [
+        containerTemplate(
+            name: 'jnlp',
+            image: '172.50.0.2:5000/openshift/jenkins-slave-py3nodejs',
+            resourceRequestCpu: '500m',
+            resourceLimitCpu: '1000m',
+            resourceRequestMemory: '1Gi',
+            resourceLimitMemory: '2Gi',
+            workingDir: '/tmp',
+            command: '',
+            args: '${computer.jnlpmac} ${computer.name}',
+            envVars: [
+                envVar(key:'DATABASE_TEST_HOST', value: "postgresql-test"),
+                envVar(key:'DATABASE_TEST_PORT', value: "5432"),
+                secretEnvVar(key: 'DATABASE_TEST_USERNAME', secretName: 'postgresql-test', secretKey: 'database-user'),
+                secretEnvVar(key: 'DATABASE_TEST_PASSWORD', secretName: 'postgresql-test', secretKey: 'database-password'),
+                secretEnvVar(key: 'DATABASE_TEST_NAME', secretName: 'postgresql-test', secretKey: 'database-name'),
+                secretEnvVar(key: 'JWT_OIDC_WELL_KNOWN_CONFIG', secretName: 'namex-keycloak-secrets', secretKey: 'JWT_OIDC_WELL_KNOWN_CONFIG'),
+                secretEnvVar(key: 'JWT_OIDC_ALGORITHMS', secretName: 'namex-keycloak-secrets', secretKey: 'JWT_OIDC_ALGORITHMS'),
+                secretEnvVar(key: 'JWT_OIDC_AUDIENCE', secretName: 'namex-keycloak-secrets', secretKey: 'JWT_OIDC_AUDIENCE'),
+                secretEnvVar(key: 'JWT_OIDC_CLIENT_SECRET', secretName: 'namex-keycloak-secrets', secretKey: 'JWT_OIDC_CLIENT_SECRET')
+           ]
+        )
+    ])
+    {
+    node (py3njs_label){
+        SLACK_TOKEN = sh (
+                script: """oc get secret/slack -o template --template="{{.data.token}}" | base64 --decode""",
+                    returnStdout: true).trim()
+
+        // send msg to slack
+        def attachment = [:]
+        attachment.fallback = "See build log for more details"
+        attachment.title = "e2e pipeline executing..."
+        attachment.color = "#00FF00" // Lime Green
+        notifySlack("e2e-${BUILD_ID}", "#e2e", "https://hooks.slack.com/services/${SLACK_TOKEN}", [attachment])
+
+        // Part 1 - CI - Source code scanning, build, dev deploy
+
+        stage('Checkout') {
+            try {
+                echo "checking out source"
+                echo "Build: ${BUILD_ID}"
+                checkout scm
+                GIT_COMMIT_SHORT_HASH = sh (
+                        script: """git describe --always""", returnStdout: true
+                    ).trim()
+                GIT_COMMIT_AUTHOR = sh (
+                        script: """git show -s --pretty=%an""", returnStdout: true
+                    ).trim()
+
+            } catch (Exception e) {
+                echo "error during checkout: ${e}"
+                // send msg to slack
+                attachment = [:]
+                attachment.fallback = "See build log for more details"
+                attachment.title = "e2evfailed to CHECKOUT :fire:"
+                attachment.color = "danger" // red
+                def logs = [:]
+                logs.type = "button"
+                logs.text = "Build Log"
+                logs.url = "https://jenkins-servicebc-ne-tools.pathfinder.gov.bc.ca/job/servicebc-ne-tools/job/servicebc-ne-tools-namex-api-pipeline/${BUILD_ID}/console"
+                logs.short = false
+                attachment.actions = [logs]
+                notifySlack("e2e-${BUILD_ID}", "#e2e", "https://hooks.slack.com/services/${SLACK_TOKEN}", [attachment])
+                error('Aborted')
+            }
+            stage ('Running Unit Test') {
+                echo "Running tests "
+                try {
+                    sh '''
+                         cd e2e
+                         node nightwatch -e chrome -a firsttest
+                    '''
+               
+
+                } catch (Exception e) {
+                    echo "EXCEPTION: ${e}"
+
+                    //send msg to slack
+                    attachment = [:]
+                    attachment.fallback = "See build log for more details"
+                    attachment.title = "e2e failed running test! :bangbang:"
+                    attachment.color = "danger" // red
+                    attachment.text = "- check logs for more info" //+ "\nCommit ${GIT_COMMIT_SHORT_HASH} by ${GIT_COMMIT_AUTHOR}"
+                    def logs = [:]
+                    logs.type = "button"
+                    logs.text = "Build Log"
+                    logs.url = "https://jenkins-servicebc-ne-tools.pathfinder.gov.bc.ca/job/servicebc-ne-tools/job/servicebc-ne-tools-namex-api-pipeline/${BUILD_ID}/console"
+                    logs.short = false
+                    attachment.actions = [logs]
+                    notifySlack("e2e-${BUILD_ID}", "#name-examination", "https://hooks.slack.com/services/${SLACK_TOKEN}", [attachment])
+                }
+
+                //send msg to slack
+                attachment = [:]
+                attachment.fallback = "See build log for more details"
+                attachment.title = "e2e passed local pytest! :white_check_mark:"
+                attachment.color = "#00FF00" // lime green
+                notifySlack("e2e-${BUILD_ID}", "#name-examination", "https://hooks.slack.com/services/${SLACK_TOKEN}", [attachment])
+
+            } // end stage - local pytest
+
+        }//end stage
+    }//end node
+    }
+
+    
+
